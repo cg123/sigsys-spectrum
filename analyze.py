@@ -10,6 +10,8 @@ import scipy.optimize
 import matplotlib.pyplot as plt
 
 import sys
+import pickle
+import os.path
 
 def todb(x):
     return 20 * numpy.log10(abs(x))
@@ -27,83 +29,109 @@ def peak(omega_0, k, omega):
 
 
 def make_response(omega, O, K, A):
-    return sum(peak(O[i], K[i], omega) * A[i] for i in range(len(K)))
+    return sum(peak(O[i], max(0, K[i]), omega) * A[i] for i in range(len(K)))
 
 
-def main(fn):
+def extract_parameters(fn, debug=False):
     (fs, x) = wavfile.read(fn)
-    print(fs, x.shape)
+    if debug:
+        print('f_s:', fs, 'shape:', x.shape)
+    if len(x.shape) > 1:
+        x = sum(x[:,i] for i in range(x.shape[1]))
 
     x = numpy.array(x, dtype=float) / 2.0**16
-    print('max(x) =', max(abs(x)))
-    shape = smooth(abs(x), window_len = 0.01 * fs)
+    if debug:
+        print('max(x) =', max(abs(x)))
+    shape = smooth(abs(x), window_len = 0.1 * fs)
 
     window = numpy.kaiser(len(x), beta=14)
-    Xw = fft(x * window / shape, n=32768)
+    Xw = fft(x * window, n=32768)
     aXw = abs(Xw)
     omega = fftfreq(Xw.size, 1./fs)
 
-    # for omega, ax in zip(omega, aXw):
-    #     print(omega, ', ', ax)
-    # print
-
-    plt.figure(1)
-    plt.semilogx(omega, todb(Xw))
-    # idx = numpy.argmax(aXw)
     idx = find_peaks_cwt(aXw, numpy.array([4, 8, 12, 16, 24, 32], dtype=float))
-    idx.sort(key=lambda idx: aXw[idx], reverse=True)
-    idx = [i for i in idx if omega[i] > 0]
 
     for i in range(len(idx)):
-        while aXw[idx[i]-1] > aXw[idx[i]] or aXw[idx[i]+1] > aXw[idx[i]]:
-            if aXw[idx[i]-1] > aXw[idx[i]]:
+        while True:
+            if idx[i] > 0 and aXw[idx[i]-1] > aXw[idx[i]]:
                 idx[i] -= 1
-            else:
+            elif idx[i] < len(aXw)-1 and aXw[idx[i]+1] > aXw[idx[i]]:
                 idx[i] += 1
+            else:
+                break
 
-    print('Detected frequency peaks:')
-    for i in range(len(idx[:50])):
-        print('{0}. {1} Hz ({2} db, {3}*f_0)'.format(i+1, omega[idx[i]], todb(aXw[idx[i]]), omega[idx[i]]/omega[idx[0]]))
+    idx.sort(key=lambda idx: aXw[idx], reverse=True)
+    idx = [i for i in idx if omega[i] > 1]
+
+    idx_f0 = idx[numpy.argmax(-omega[idx[:5]])]
+    if debug:
+        print('f0:', omega[idx_f0])
+
+    idx = [idx_f0] + [i for i in idx if i != idx_f0]
+
+    if debug:
+        print('Detected frequency peaks:')
+        for i in range(len(idx[:50])):
+            print('{0}. {1} Hz ({2} db, {3}*f_0)'.format(i+1, omega[idx[i]], todb(aXw[idx[i]]), omega[idx[i]]/omega[idx[0]]))
 
     O = omega[idx[:50]]
     K = numpy.zeros(len(O)) + 1
     A = aXw[idx[:50]]
 
     K, _ = scipy.optimize.leastsq(lambda K: make_response(omega, O, K, A) - aXw, K)
-    # O = OKA[0:len(O)]
-    # K = OKA[len(O):2*len(O)]
-    # A = OKA[2*len(O):]
-    print(O, K, A)
+    if debug:
+        print(K)
 
-    omega_1 = fftfreq(len(x), 1./fs)
-    resp = make_response(omega_1, O, K, A)
+    return O, K, A, shape
 
-    plt.hold(True)
-    plt.semilogx(omega_1, todb(resp))
-    plt.semilogx(omega[idx[0]], todb(Xw[idx[0]]), 'go')
 
-    plt.legend(["Original FFT Amplitude", "Synthesized Response", "Fundamental Frequency"])
-    plt.show()
-
-    note = 440  # Hz
-
-    res = numpy.zeros(len(x), dtype=complex)
-    t = numpy.linspace(0, len(x)/fs, len(x))
-    for note in [440]:#[220, 293.66, 440, 698.46]:
-        for i in range(len(O)):
-            freq = O[i]/O[0] * note
-            res += A[i] * numpy.exp(1j*(-2*numpy.pi*t*freq) - K[i]*abs(t)) #numpy.cos(freq * 2 * numpy.pi * t)  # numpy.exp(1j*(-2*numpy.pi*t*freq) - K[i]*abs(t))#
+def synthesize(f0, shape, O, K, A, fs=44100):
+    res = numpy.zeros(len(shape), dtype=complex)
+    t = numpy.linspace(0, len(shape)/fs, len(shape))
+    for i in range(len(O)):
+        freq = O[i]/O[0] * f0
+        res += A[i] * numpy.exp(1j*(-2*numpy.pi*t*freq) - K[i]*abs(t))
 
     res = numpy.real(res)
     res *= shape
     res /= max(res)
-    # res = numpy.real(ifft(resp))
-    # res *= smooth(abs(x), window_len = 0.01 * fs) / smooth(abs(res), window_len = 0.01 * fs)
+    return res
 
-    wavfile.write('out.wav', fs, res)
-    print('Wrote out.wav')
-    return 0
+
+def main(argv):
+    if not argv:
+        print('usage:\n\tanalyze.py command [options]\n\ncommands:\n\tmodel <sample.wav> [debug]\n\tplay <model.dat> <freq>')
+        return -1
+
+    command = argv[0]
+    if command == 'model':
+        debug = False
+        if len(argv) not in (2, 3):
+            print('Expected one or two arguments')
+            return -1
+        if len(argv) == 3:
+            if argv[2] == 'debug':
+                debug = True
+            else:
+                print('Third argument to model must be debug')
+                return -1
+
+        O, K, A, shape = extract_parameters(argv[1], debug)
+
+        fn = os.path.basename(argv[1]).replace('.wav','')
+        pickle.dump((O, K, A, shape), open('models/'+fn+'.dat', 'wb'))
+        return 0
+    elif command == 'play':
+        assert(len(argv) == 3)
+        O, K, A, shape = pickle.load(open(argv[1], 'rb'))
+        note = int(argv[2])
+        wave = synthesize(note, shape, O, K, A)
+        new_fn = os.path.basename(argv[1]).replace('.dat','')+'-'+str(note)+'.wav'
+        wavfile.write(new_fn, 44100, wave)
+    else:
+        print('Invalid command')
+        return -1
 
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1]))
+    sys.exit(main(sys.argv[1:]))
