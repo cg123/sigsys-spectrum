@@ -35,10 +35,11 @@ def main(fn):
     print(fs, x.shape)
 
     x = numpy.array(x, dtype=float) / 2.0**16
-    print('max(x) =', max(x))
+    print('max(x) =', max(abs(x)))
+    shape = smooth(abs(x), window_len = 0.01 * fs)
 
     window = numpy.kaiser(len(x), beta=14)
-    Xw = fft(x * window, n=32768)
+    Xw = fft(x * window / shape, n=32768)
     aXw = abs(Xw)
     omega = fftfreq(Xw.size, 1./fs)
 
@@ -46,6 +47,7 @@ def main(fn):
     #     print(omega, ', ', ax)
     # print
 
+    plt.figure(1)
     plt.semilogx(omega, todb(Xw))
     # idx = numpy.argmax(aXw)
     idx = find_peaks_cwt(aXw, numpy.array([4, 8, 12, 16, 24, 32], dtype=float))
@@ -78,11 +80,10 @@ def main(fn):
 
     plt.hold(True)
     plt.semilogx(omega_1, todb(resp))
-    plt.show()
+    plt.semilogx(omega[idx[0]], todb(Xw[idx[0]]), 'go')
 
-    # plt.hold(True)
-    # plt.semilogx(omega[idx[:50]], todb(Xw[idx[:50]]), 'go')
-    # plt.show()
+    plt.legend(["Original FFT Amplitude", "Synthesized Response", "Fundamental Frequency"])
+    plt.show()
 
     note = 440  # Hz
 
@@ -91,10 +92,11 @@ def main(fn):
     for note in [440]:#[220, 293.66, 440, 698.46]:
         for i in range(len(O)):
             freq = O[i]/O[0] * note
-            res += A[i] * numpy.cos(freq * 2 * numpy.pi * t)  # numpy.exp(1j*(-2*numpy.pi*t*freq) - K[i]*abs(t))#
+            res += A[i] * numpy.exp(1j*(-2*numpy.pi*t*freq) - K[i]*abs(t)) #numpy.cos(freq * 2 * numpy.pi * t)  # numpy.exp(1j*(-2*numpy.pi*t*freq) - K[i]*abs(t))#
 
-    res = numpy.real(res)/max(numpy.real(res))
-    res *= smooth(abs(x), window_len = 0.01 * fs)
+    res = numpy.real(res)
+    res *= shape
+    res /= max(res)
     # res = numpy.real(ifft(resp))
     # res *= smooth(abs(x), window_len = 0.01 * fs) / smooth(abs(res), window_len = 0.01 * fs)
 
